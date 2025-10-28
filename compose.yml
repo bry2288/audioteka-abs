@@ -6,6 +6,7 @@ services:
     environment:
       - LANGUAGE=pl
       - ADD_AUDIOTEKA_LINK_TO_DESCRIPTION=true # Set to false to hide the Audioteka link in the description
+      - METADATA_CONCURRENCY=5 # Number of concurrent metadata fetches
     restart: unless-stopped
     ports:
       - "3001:3001"

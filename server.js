@@ -73,6 +73,12 @@ app.use((req, res, next) => {
 
 const language = process.env.LANGUAGE || 'pl';  // Default to Polish if not specified
 const addAudiotekaLinkToDescription = (process.env.ADD_AUDIOTEKA_LINK_TO_DESCRIPTION || 'true').toLowerCase() === 'true';
+// Metadata fetch concurrency (configurable via env var). Default to 5 when not provided or invalid.
+const DEFAULT_METADATA_CONCURRENCY = 5;
+const metadataConcurrency = (() => {
+  const v = parseInt(process.env.METADATA_CONCURRENCY, 10);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_METADATA_CONCURRENCY;
+})();
 
 class AudiotekaProvider {
   constructor() {
@@ -82,9 +88,9 @@ class AudiotekaProvider {
     this.searchUrl = language === 'cz' ? 'https://audioteka.com/cz/vyhledavani' : 'https://audioteka.com/pl/szukaj';
   }
 
-  async searchBooks(query, author = '') {
+  async searchBooks(query, author = '', requestId = 'req') {
     try {
-      console.log(`Searching for: "${query}" by "${author}"`);
+      console.log(`[${requestId}] Searching for: "${query}" by "${author}"`);
       const searchUrl = `${this.searchUrl}?phrase=${encodeURIComponent(query)}`;
       
       const response = await axios.get(searchUrl, {
@@ -96,11 +102,11 @@ class AudiotekaProvider {
       });
       const $ = cheerio.load(response.data);
 
-      console.log('Search URL:', searchUrl);
+  console.log(`[${requestId}] Search URL:`, searchUrl);
 
       const matches = [];
       const $books = $('.adtk-item.teaser_teaser__FDajW');
-      console.log('Number of books found:', $books.length);
+  console.log(`[${requestId}] Number of books found:`, $books.length);
 
       $books.each((index, element) => {
         const $book = $(element);
@@ -130,27 +136,52 @@ class AudiotekaProvider {
         }
       });
 
-      const fullMetadata = await Promise.all(matches.map(match => this.getFullMetadata(match)));
+  // Fetch full metadata with limited concurrency to avoid overloading the site
+  const fullMetadata = await this.mapWithConcurrency(matches, match => this.getFullMetadata(match, requestId), metadataConcurrency);
       
       // Filter out null results (non-Czech books for Czech users)
       const filteredMetadata = fullMetadata.filter(book => book !== null);
       
-      console.log(`Filtered ${fullMetadata.length - filteredMetadata.length} non-Czech books`);
+  console.log(`[${requestId}] Filtered ${fullMetadata.length - filteredMetadata.length} non-Czech books`);
       
       return { matches: filteredMetadata };
     } catch (error) {
-      console.error('Error searching books:', error.message, error.stack);
+      console.error(`[${requestId}] Error searching books:`, error.message, error.stack);
       return { matches: [] };
     }
   }
+  // Helper to map over items with limited concurrency
+  async mapWithConcurrency(items, iteratorFn, limit = 5) {
+    const results = new Array(items.length);
+    let i = 0;
+    const workers = Array(Math.min(limit, items.length)).fill().map(async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= items.length) return;
+        try {
+          results[idx] = await iteratorFn(items[idx]);
+        } catch (err) {
+          // keep error isolated per-item
+          console.error('Error in mapWithConcurrency item:', err && err.message || err);
+          results[idx] = null;
+        }
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
   async getFullMetadata(match) {
     try {
-      console.log(`Fetching full metadata for: ${match.title}`);
+      // backward compatible when requestId is not passed
+      let requestId = 'req';
+      // if caller passed a requestId as second arg, it will be available in arguments
+      if (arguments.length >= 2 && arguments[1]) requestId = arguments[1];
+      console.log(`[${requestId}] Fetching full metadata for: ${match.title}`);
       const response = await axios.get(match.url);
       const $ = cheerio.load(response.data);
 
       // Debug: Log all table rows to see the actual structure
-      console.log('=== DEBUG: All table rows ===');
+  console.log(`[${requestId}] === DEBUG: All table rows ===`);
       $('table tr').each((i, el) => {
         const firstCell = $(el).find('td:first-child').text().trim();
         const lastCell = $(el).find('td:last-child').text().trim();
@@ -158,15 +189,15 @@ class AudiotekaProvider {
       });
 
       // Debug: Try different div structures for Czech site
-      console.log('=== DEBUG: Trying different selectors ===');
-      console.log('All tables count:', $('table').length);
-      console.log('All tr count:', $('tr').length);
-      console.log('All td count:', $('td').length);
+  console.log(`[${requestId}] === DEBUG: Trying different selectors ===`);
+  console.log(`[${requestId}] All tables count:`, $('table').length);
+  console.log(`[${requestId}] All tr count:`, $('tr').length);
+  console.log(`[${requestId}] All td count:`, $('td').length);
       
       // Debug: Look for different structures
-      console.log('=== DEBUG: Looking for dt/dd structure ===');
+      console.log(`[${requestId}] === DEBUG: Looking for dt/dd structure ===`);
       $('dt, dd').each((i, el) => {
-        console.log(`dt/dd ${i}: "${$(el).text().trim()}"`);
+        console.log(`[${requestId}] dt/dd ${i}: "${$(el).text().trim()}"`);
       });      // Get narrator - improved selectors for Czech site
       let narrators = '';
       if (language === 'cz') {
@@ -221,7 +252,7 @@ class AudiotekaProvider {
           narrators = narrators.replace(/([a-záčďéěíňóřšťúůýž])([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])/g, '$1, $2');
         }
         
-        console.log(`Narrator extracted: "${narrators}"`);
+        console.log(`[${requestId}] Narrator extracted: "${narrators}"`);
       } else {
         // Polish site narrator extraction
         let narratorCell = $('dt').filter(function() {
@@ -250,7 +281,7 @@ class AudiotekaProvider {
           narrators = narrators.replace(/([a-ząćęłńóśźż])([A-ZĄĆĘŁŃÓŚŹŻ])/g, '$1, $2');
         }
         
-        console.log(`Narrator extracted: "${narrators}"`);
+        console.log(`[${requestId}] Narrator extracted: "${narrators}"`);
       }
 
       // Get duration - improved selectors for Czech site
@@ -280,7 +311,7 @@ class AudiotekaProvider {
           }).find('.value').text().trim();
         }
         
-        console.log(`Duration extracted: "${durationStr}"`);
+        console.log(`[${requestId}] Duration extracted: "${durationStr}"`);
       } else {
         durationStr = $('.product-table tr:contains("Długość") td:last-child').text().trim();
       }
@@ -419,11 +450,11 @@ class AudiotekaProvider {
         return lang;
       })() : null;
 
-      console.log(`Book language found: "${bookLanguage}"`);
+  console.log(`[${requestId}] Book language found: "${bookLanguage}"`);
 
       // Filter out non-Czech books for Czech users
       if (language === 'cz' && bookLanguage && !bookLanguage.toLowerCase().includes('čeština')) {
-        console.log(`Filtering out ${match.title} - language is "${bookLanguage}", not Czech`);
+        console.log(`[${requestId}] Filtering out ${match.title} - language is "${bookLanguage}", not Czech`);
         return null;
       }
 
@@ -478,10 +509,13 @@ class AudiotekaProvider {
         },
       };
 
-      console.log(`Full metadata for ${match.title}:`, JSON.stringify(fullMetadata, null, 2));
+        console.log(`[${requestId}] Full metadata for ${match.title}:`, JSON.stringify(fullMetadata, null, 2));
       return fullMetadata;
     } catch (error) {
-      console.error(`Error fetching full metadata for ${match.title}:`, error.message, error.stack);
+      // try to capture request-scoped info if available
+      let requestId = 'req';
+      if (arguments.length >= 2 && arguments[1]) requestId = arguments[1];
+      console.error(`[${requestId}] Error fetching full metadata for ${match.title}:`, error.message, error.stack);
       return match;
     }
   }
@@ -535,4 +569,5 @@ app.get('/search', async (req, res) => {
 
 app.listen(port, () => {
   console.log(`Audioteka provider listening on port ${port}, language: ${language}, add link to description: ${addAudiotekaLinkToDescription}`);
+  console.log(`Metadata fetch concurrency: ${metadataConcurrency}`);
 });

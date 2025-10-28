@@ -43,12 +43,24 @@ services:
     container_name: audioteka-abs
     environment:
       - LANGUAGE=pl # For Czech users: Change enviorment line to - LANGUAGE=cz
-      - ADD_AUDIOTEKA_LINK_TO_DESCRIPTION=true # Optional: Set to 'false' to remove the Audioteka link from the description
+      - ADD_AUDIOTEKA_LINK_TO_DESCRIPTION=true
+      - METADATA_CONCURRENCY=5
     restart: unless-stopped
     ports:
       - "3001:3001"
 ```
 #### 
+
+#### Enviroment variables:
+
+The following environment variables control provider behaviour. Set them in your compose file or environment.
+
+| Variable | Default | Description |
+|---|---:|---|
+| `LANGUAGE` | `pl` | Which Audioteka site to use. Set to `pl` for Polish site (default) or `cz` for Czech site. |
+| `ADD_AUDIOTEKA_LINK_TO_DESCRIPTION` | `true` | When `true`, the provider prepends an Audioteka link to the returned description. Set to `false` to disable. |
+| `METADATA_CONCURRENCY` | `5` | Max concurrent detail-page fetches performed when enriching search results. Use a lower value to reduce load and avoid rate limits. |
+
 
 2. Pull the latest Docker image:
 ```

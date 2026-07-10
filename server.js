@@ -10,6 +10,65 @@ function cleanCoverUrl(url) {
   return url;
 }
 
+// Parse ISO-8601 duration (e.g. "PT6H45M" from JSON-LD) into minutes
+function parseIsoDuration(iso) {
+  if (!iso || typeof iso !== 'string') return undefined;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
+  if (!m) return undefined;
+  const hours = parseInt(m[1] || '0', 10);
+  const minutes = parseInt(m[2] || '0', 10);
+  const total = hours * 60 + minutes;
+  return total > 0 ? total : undefined;
+}
+
+// Extract the schema.org Product/Audiobook JSON-LD object embedded in product pages.
+// This is the most future-proof data source - it is kept for SEO and does not
+// depend on hashed CSS class names.
+function extractProductJsonLd($) {
+  let product = null;
+  $('script[type="application/ld+json"]').each((i, el) => {
+    if (product) return;
+    try {
+      const parsed = JSON.parse($(el).contents().text());
+      const nodes = Array.isArray(parsed) ? parsed : [parsed];
+      for (const node of nodes) {
+        const types = [].concat(node && node['@type'] ? node['@type'] : []);
+        if (types.includes('Audiobook') || types.includes('Product')) {
+          product = node;
+          return;
+        }
+      }
+    } catch (e) {
+      // ignore malformed JSON-LD blocks
+    }
+  });
+  return product;
+}
+
+// Look up a value in the <dt>/<dd> details list by label (e.g. "Głosy", "Długość").
+// Returns the <dd> cheerio element or null.
+function ddForLabel($, labels) {
+  let result = null;
+  $('dt').each((i, el) => {
+    if (result) return;
+    const text = $(el).text().trim();
+    if (labels.includes(text)) {
+      const dd = $(el).next('dd');
+      if (dd.length) result = dd;
+    }
+  });
+  return result;
+}
+
+function textOrJoinedLinks($, el) {
+  if (!el || !el.length) return '';
+  const links = el.find('a');
+  if (links.length > 0) {
+    return links.map((i, a) => $(a).text().trim()).get().filter(Boolean).join(', ');
+  }
+  return el.text().trim();
+}
+
 function parseDuration(durationStr) {
   if (!durationStr) return undefined;
 
@@ -80,12 +139,29 @@ const metadataConcurrency = (() => {
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_METADATA_CONCURRENCY;
 })();
 
+// Browser-like headers.
+// IMPORTANT: audioteka.com (Next.js) returns an empty page shell (no search results)
+// when the request does not contain a browser-like "Accept: text/html..." header.
+// Axios sends "Accept: application/json, text/plain, */*" by default, which broke scraping.
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+};
+
+function browserHeaders() {
+  return {
+    ...BROWSER_HEADERS,
+    'Accept-Language': language === 'cz' ? 'cs-CZ,cs;q=0.9' : 'pl-PL,pl;q=0.9',
+  };
+}
+
 class AudiotekaProvider {
   constructor() {
     this.id = 'audioteka';
     this.name = 'Audioteka';
     this.baseUrl = 'https://audioteka.com';
-    this.searchUrl = language === 'cz' ? 'https://audioteka.com/cz/vyhledavani' : 'https://audioteka.com/pl/szukaj';
+    // Trailing slash is required now - non-slash URLs respond with a redirect
+    this.searchUrl = language === 'cz' ? 'https://audioteka.com/cz/vyhledavani/' : 'https://audioteka.com/pl/szukaj/';
   }
 
   async searchBooks(query, author = '', requestId = 'req') {
@@ -94,30 +170,39 @@ class AudiotekaProvider {
       const searchUrl = `${this.searchUrl}?phrase=${encodeURIComponent(query)}`;
       
       const response = await axios.get(searchUrl, {
-        headers:
-         {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Accept-Language': language === 'cz' ? 'cs-CZ' : 'pl-PL'
-        }
+        headers: browserHeaders()
       });
       const $ = cheerio.load(response.data);
 
   console.log(`[${requestId}] Search URL:`, searchUrl);
 
       const matches = [];
-      const $books = $('.adtk-item.teaser_teaser__FDajW');
+      // Class name hashes (e.g. teaser_teaser__FDajW) change on Audioteka deployments,
+      // and the old stable class "adtk-item" was removed - match on the stable
+      // CSS-module prefix instead of the full hashed class name.
+      const $books = $('li[class*="teaser_teaser__"], .adtk-item[class*="teaser_teaser__"]');
   console.log(`[${requestId}] Number of books found:`, $books.length);
 
       $books.each((index, element) => {
         const $book = $(element);
-        
-        const title = $book.find('.teaser_title__hDeCG').text().trim();
-        const bookUrl = this.baseUrl + $book.find('.teaser_link__fxVFQ').attr('href');
-        const authors = [$book.find('.teaser_author__LWTRi').text().trim()];
-        const cover = cleanCoverUrl($book.find('.teaser_coverImage__YMrBt').attr('src'));
-        const rating = parseFloat($book.find('.teaser-footer_rating__TeVOA').text().trim()) || null;
 
-        const id = $book.attr('data-item-id') || bookUrl.split('/').pop();
+        const title = $book.find('[class*="teaser_title__"]').first().text().trim();
+        const href = $book.find('a[class*="teaser_link__"]').attr('href') || $book.find('a[href*="/audiobook/"]').attr('href');
+        if (!href) return;
+        const bookUrl = this.baseUrl + href;
+        const authors = [$book.find('[class*="teaser_author__"]').first().text().trim()];
+        // Cover <img> may be wrapped in <noscript> (lazy loading) - cheerio does not
+        // parse <noscript> content as HTML, so fall back to extracting src via regex.
+        let coverSrc = $book.find('img[class*="teaser_coverImage__"]').attr('src');
+        if (!coverSrc) {
+          const noscriptHtml = $book.find('noscript').html() || $book.find('noscript').text() || '';
+          const srcMatch = noscriptHtml.match(/src="([^"]+)"/);
+          if (srcMatch) coverSrc = srcMatch[1].replace(/&amp;/g, '&');
+        }
+        const cover = cleanCoverUrl(coverSrc);
+        const rating = parseFloat($book.find('[class*="teaser-footer_rating__"]').first().text().trim()) || null;
+
+        const id = $book.attr('data-item-id') || bookUrl.replace(/\/+$/, '').split('/').pop();
 
         if (title && bookUrl && authors.length > 0) {
           matches.push({
@@ -177,298 +262,129 @@ class AudiotekaProvider {
       // if caller passed a requestId as second arg, it will be available in arguments
       if (arguments.length >= 2 && arguments[1]) requestId = arguments[1];
       console.log(`[${requestId}] Fetching full metadata for: ${match.title}`);
-      const response = await axios.get(match.url);
+      const response = await axios.get(match.url, { headers: browserHeaders() });
       const $ = cheerio.load(response.data);
 
-      // Debug: Log all table rows to see the actual structure
-  console.log(`[${requestId}] === DEBUG: All table rows ===`);
-      $('table tr').each((i, el) => {
-        const firstCell = $(el).find('td:first-child').text().trim();
-        const lastCell = $(el).find('td:last-child').text().trim();
-        console.log(`Row ${i}: "${firstCell}" -> "${lastCell}"`);
-      });
-
-      // Debug: Try different div structures for Czech site
-  console.log(`[${requestId}] === DEBUG: Trying different selectors ===`);
-  console.log(`[${requestId}] All tables count:`, $('table').length);
-  console.log(`[${requestId}] All tr count:`, $('tr').length);
-  console.log(`[${requestId}] All td count:`, $('td').length);
-      
-      // Debug: Look for different structures
-      console.log(`[${requestId}] === DEBUG: Looking for dt/dd structure ===`);
-      $('dt, dd').each((i, el) => {
-        console.log(`[${requestId}] dt/dd ${i}: "${$(el).text().trim()}"`);
-      });      // Get narrator - improved selectors for Czech site
-      let narrators = '';
-      if (language === 'cz') {
-        // Try multiple selector approaches for Czech site
-        let narratorCell = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Interpret' || text === 'Čte';
-        }).find('td:last-child');
-        
-        // Check if there are individual links for narrators
-        const narratorLinks = narratorCell.find('a');
-        if (narratorLinks.length > 0) {
-          narrators = narratorLinks.map((i, el) => $(el).text().trim()).get().join(', ');
-        } else {
-          narrators = narratorCell.text().trim();
-        }
-        
-        // Fallback: try dt/dd structure
-        if (!narrators) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Interpret' || text === 'Čte') {
-              const ddElement = $(el).next('dd');
-              const ddLinks = ddElement.find('a');
-              if (ddLinks.length > 0) {
-                narrators = ddLinks.map((i, el) => $(el).text().trim()).get().join(', ');
-              } else {
-                narrators = ddElement.text().trim();
-              }
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (!narrators) {
-          const narratorDiv = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Interpret' || 
-                   $(this).find('.label').text().trim() === 'Čte';
-          }).find('.value');
-          
-          const divLinks = narratorDiv.find('a');
-          if (divLinks.length > 0) {
-            narrators = divLinks.map((i, el) => $(el).text().trim()).get().join(', ');
-          } else {
-            narrators = narratorDiv.text().trim();
-          }
-        }
-        
-        // If we still have concatenated names without separators, try to add commas
-        if (narrators && !narrators.includes(',') && narrators.match(/[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][a-záčďéěíňóřšťúůýž]+[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]/)) {
-          // Split on capital letters that follow lowercase letters (indicating new names)
-          narrators = narrators.replace(/([a-záčďéěíňóřšťúůýž])([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])/g, '$1, $2');
-        }
-        
-        console.log(`[${requestId}] Narrator extracted: "${narrators}"`);
-      } else {
-        // Polish site narrator extraction
-        let narratorCell = $('dt').filter(function() {
-          return $(this).text().trim() === 'Głosy';
-        }).next('dd');
-        
-        // Check if there are individual links for narrators
-        const narratorLinks = narratorCell.find('a');
-        if (narratorLinks.length > 0) {
-          narrators = narratorLinks.map((i, el) => $(el).text().trim()).get().join(', ');
-        } else {
-          narrators = narratorCell.text().trim();
-        }
-        
-        // Fallback: try table structure
-        if (!narrators) {
-          narrators = $('.product-table tr:contains("Głosy") td:last-child a')
-            .map((i, el) => $(el).text().trim())
-            .get()
-            .join(', ') || $('.product-table tr:contains("Głosy") td:last-child').text().trim();
-        }
-        
-        // If we still have concatenated names without separators, try to add commas
-        if (narrators && !narrators.includes(',') && narrators.match(/[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+[A-ZĄĆĘŁŃÓŚŹŻ]/)) {
-          // Split on capital letters that follow lowercase letters (indicating new names)
-          narrators = narrators.replace(/([a-ząćęłńóśźż])([A-ZĄĆĘŁŃÓŚŹŻ])/g, '$1, $2');
-        }
-        
-        console.log(`[${requestId}] Narrator extracted: "${narrators}"`);
+      // Primary data source: schema.org Product/Audiobook JSON-LD embedded in the page.
+      // Secondary: the <dt>/<dd> details list. Legacy selectors kept as last resort.
+      const ld = extractProductJsonLd($);
+      if (ld) {
+        console.log(`[${requestId}] Found product JSON-LD for: ${match.title}`);
       }
 
-      // Get duration - improved selectors for Czech site
-      let durationStr = '';
-      if (language === 'cz') {
-        // Try multiple selector approaches for Czech site
-        durationStr = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Délka' || text === 'Stopáž';
-        }).find('td:last-child').text().trim();
-        
-        // Fallback: try dt/dd structure
-        if (!durationStr) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Délka' || text === 'Stopáž') {
-              durationStr = $(el).next('dd').text().trim();
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (!durationStr) {
-          durationStr = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Délka' || 
-                   $(this).find('.label').text().trim() === 'Stopáž';
-          }).find('.value').text().trim();
-        }
-        
-        console.log(`[${requestId}] Duration extracted: "${durationStr}"`);
-      } else {
+      const narratorLabels = language === 'cz' ? ['Interpret', 'Čte'] : ['Głosy', 'Lektor'];
+      const durationLabels = language === 'cz' ? ['Délka', 'Stopáž'] : ['Długość'];
+      const publisherLabels = language === 'cz' ? ['Vydavatel', 'Nakladatel'] : ['Wydawca'];
+      const genreLabels = language === 'cz' ? ['Kategorie', 'Žánr'] : ['Kategoria'];
+      const languageLabels = language === 'cz' ? ['Jazyk'] : ['Język'];
+      const seriesLabels = language === 'cz' ? ['Cyklus', 'Série'] : ['Cykl', 'Seria'];
+
+      // --- Narrator ---
+      let narrators = '';
+      if (ld && ld.readBy) {
+        narrators = [].concat(ld.readBy).map(p => (p && p.name) || '').filter(Boolean).join(', ');
+      }
+      if (!narrators) {
+        narrators = textOrJoinedLinks($, ddForLabel($, narratorLabels));
+      }
+      if (!narrators) {
+        // Legacy fallbacks (old table/div based layouts)
+        narrators = $('.product-table tr:contains("Głosy") td:last-child a, table tr:contains("Interpret") td:last-child a')
+          .map((i, el) => $(el).text().trim()).get().join(', ');
+      }
+      // If we still have concatenated names without separators, try to add commas
+      if (narrators && !narrators.includes(',') && narrators.match(/[A-ZĄĆĘŁŃÓŚŹŻÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][a-ząćęłńóśźżáčďéěíňóřšťúůýž]+[A-ZĄĆĘŁŃÓŚŹŻÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]/)) {
+        narrators = narrators.replace(/([a-ząćęłńóśźżáčďéěíňóřšťúůýž])([A-ZĄĆĘŁŃÓŚŹŻÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])/g, '$1, $2');
+      }
+      console.log(`[${requestId}] Narrator extracted: "${narrators}"`);
+
+      // --- Duration ---
+      const durationDd = ddForLabel($, durationLabels);
+      let durationStr = durationDd ? durationDd.text().trim() : '';
+      if (!durationStr) {
         durationStr = $('.product-table tr:contains("Długość") td:last-child').text().trim();
       }
-
-      const durationInMinutes = parseDuration(durationStr);
-
-      // Get publisher - improved selectors for Czech site
-      let publisher = '';
-      if (language === 'cz') {
-        // Try multiple selector approaches for Czech site
-        publisher = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Vydavatel' || text === 'Nakladatel';
-        }).find('td:last-child').text().trim();
-        
-        // Fallback: try dt/dd structure
-        if (!publisher) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Vydavatel' || text === 'Nakladatel') {
-              publisher = $(el).next('dd').text().trim();
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (!publisher) {
-          publisher = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Vydavatel' || 
-                   $(this).find('.label').text().trim() === 'Nakladatel';
-          }).find('.value').text().trim();
-        }
-        
-        console.log(`Publisher extracted: "${publisher}"`);
-      } else {
-        publisher = $('.product-table tr:contains("Wydawca") td:last-child a').text().trim() ||
-                    $('.product-table tr:contains("Wydawca") td:last-child').text().trim();
+      let durationInMinutes = parseDuration(durationStr);
+      if (durationInMinutes === undefined && ld && ld.duration) {
+        durationInMinutes = parseIsoDuration(ld.duration);
+        console.log(`[${requestId}] Duration from JSON-LD (${ld.duration}): ${durationInMinutes} min`);
       }
 
-      // Get type - improved selectors for Czech site
-      let type = '';
-      if (language === 'cz') {
-        // Try multiple selector approaches for Czech site
-        type = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Typ';
-        }).find('td:last-child').text().trim();
-        
-        // Fallback: try dt/dd structure
-        if (!type) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Typ') {
-              type = $(el).next('dd').text().trim();
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (!type) {
-          type = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Typ';
-          }).find('.value').text().trim();
-        }
-        
-        console.log(`Type extracted: "${type}"`);
-      } else {
+      // --- Publisher ---
+      let publisher = textOrJoinedLinks($, ddForLabel($, publisherLabels));
+      if (!publisher && ld && ld.brand) {
+        publisher = [].concat(ld.brand).map(b => (b && b.name) || '').filter(Boolean).join(', ');
+      }
+      if (!publisher) {
+        publisher = $('.product-table tr:contains("Wydawca") td:last-child').text().trim();
+      }
+      console.log(`[${requestId}] Publisher extracted: "${publisher}"`);
+
+      // --- Type ---
+      let type = textOrJoinedLinks($, ddForLabel($, ['Typ']));
+      if (!type) {
         type = $('.product-table tr:contains("Typ") td:last-child').text().trim();
       }
 
-      // Get categories/genres - improved selectors for Czech site
-      let genres = [];
-      if (language === 'cz') {
-        // Try multiple selector approaches for Czech site
-        genres = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Kategorie' || text === 'Žánr';
-        }).find('td:last-child a')
-          .map((i, el) => $(el).text().trim())
-          .get();
-        
-        // Fallback: try dt/dd structure
-        if (genres.length === 0) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Kategorie' || text === 'Žánr') {
-              genres = $(el).next('dd').find('a')
-                .map((i, el) => $(el).text().trim())
-                .get();
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (genres.length === 0) {
-          genres = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Kategorie' || 
-                   $(this).find('.label').text().trim() === 'Žánr';
-          }).find('.value a')
-            .map((i, el) => $(el).text().trim())
-            .get();
-        }
-        
-        console.log(`Genres extracted: ${JSON.stringify(genres)}`);
-      } else {
-        genres = $('.product-table tr:contains("Kategoria") td:last-child a')
-          .map((i, el) => $(el).text().trim())
-          .get();
+      // --- Genres ---
+      const genreDd = ddForLabel($, genreLabels);
+      let genres = genreDd ? genreDd.find('a').map((i, el) => $(el).text().trim()).get() : [];
+      if (genres.length === 0 && genreDd) {
+        genres = [genreDd.text().trim()].filter(Boolean);
       }
+      if (genres.length === 0 && ld && ld.genre) {
+        genres = [].concat(ld.genre).filter(Boolean);
+      }
+      if (genres.length === 0) {
+        genres = $('.product-table tr:contains("Kategoria") td:last-child a')
+          .map((i, el) => $(el).text().trim()).get();
+      }
+      console.log(`[${requestId}] Genres extracted: ${JSON.stringify(genres)}`);
 
-      // Get language - improved selectors for Czech site
-      const bookLanguage = language === 'cz' ? (() => {
-        // Try multiple selector approaches for Czech site
-        let lang = $('table tr').filter(function() {
-          const text = $(this).find('td:first-child').text().trim();
-          return text === 'Jazyk';
-        }).find('td:last-child').text().trim();
-        
-        // Fallback: try dt/dd structure
-        if (!lang) {
-          $('dt').each((i, el) => {
-            const text = $(el).text().trim();
-            if (text === 'Jazyk') {
-              lang = $(el).next('dd').text().trim();
-            }
-          });
-        }
-        
-        // Fallback: try div structure
-        if (!lang) {
-          lang = $('.product-detail-item').filter(function() {
-            return $(this).find('.label').text().trim() === 'Jazyk';
-          }).find('.value').text().trim();
-        }
-        
-        return lang;
-      })() : null;
-
-  console.log(`[${requestId}] Book language found: "${bookLanguage}"`);
+      // --- Language ---
+      const langDd = ddForLabel($, languageLabels);
+      let bookLanguage = langDd ? langDd.text().trim() : '';
+      if (!bookLanguage && ld && ld.inLanguage) {
+        bookLanguage = String(ld.inLanguage);
+      }
+      console.log(`[${requestId}] Book language found: "${bookLanguage}"`);
 
       // Filter out non-Czech books for Czech users
-      if (language === 'cz' && bookLanguage && !bookLanguage.toLowerCase().includes('čeština')) {
-        console.log(`[${requestId}] Filtering out ${match.title} - language is "${bookLanguage}", not Czech`);
-        return null;
+      if (language === 'cz' && bookLanguage) {
+        const langLower = bookLanguage.toLowerCase();
+        if (!langLower.includes('čeština') && langLower !== 'cs') {
+          console.log(`[${requestId}] Filtering out ${match.title} - language is "${bookLanguage}", not Czech`);
+          return null;
+        }
       }
 
-      // Get series information - updated selectors
-      const series = $('.collections_list__09q3I li a, .product-series a, .series-info a, .product-table tr:contains("Seria") td:last-child a')
-        .map((i, el) => $(el).text().trim())
-        .get();
+      // --- Series ---
+      const seriesDd = ddForLabel($, seriesLabels);
+      let series = seriesDd ? seriesDd.find('a').map((i, el) => $(el).text().trim()).get() : [];
+      if (series.length === 0) {
+        series = $('[class*="collections_list__"] li a, .product-series a, .series-info a, .product-table tr:contains("Seria") td:last-child a')
+          .map((i, el) => $(el).text().trim())
+          .get();
+      }
 
-      // Get rating - try multiple selectors for rating
-      const rating = parseFloat($('.StarIcon__Label-sc-6cf2a375-2, .rating-value, .product-rating .value, .rating .value').text().trim()) || 
-                     parseFloat($('[class*="rating"]').text().trim()) || null;
-      
-      // Get description with HTML - updated selectors for both sites
-      const descriptionHtml = $('.description_description__6gcfq, .product-description, .book-description, .product-desc').html();
+      // --- Rating ---
+      let rating = parseFloat($('[class*="rating-badge_badgeContent__"]').first().text().trim().replace(',', '.')) || null;
+      if (rating === null && ld && ld.aggregateRating && ld.aggregateRating.ratingValue !== undefined) {
+        rating = parseFloat(ld.aggregateRating.ratingValue) || null;
+      }
+      if (rating === null) {
+        rating = parseFloat($('.StarIcon__Label-sc-6cf2a375-2, .rating-value, .product-rating .value, .rating .value').text().trim()) || null;
+      }
+
+      // --- Description (HTML) ---
+      // The page can contain several elements with a "description_description__" prefix
+      // (e.g. a club-price note), so prefer the one inside the section with the
+      // "Opis"/"Popis" header, then fall back to legacy selectors.
+      let descriptionHtml = $('[class*="description_header__"]').first().parent()
+        .find('[class*="description_description__"]').first().html();
+      if (!descriptionHtml) {
+        descriptionHtml = $('.description_description__6gcfq, .product-description, .book-description, .product-desc').html();
+      }
       
       // Basic sanitization
       const sanitizedDescription = descriptionHtml
@@ -484,8 +400,14 @@ class AudiotekaProvider {
         console.log(`Audioteka link will be added to the description for ${match.title}`);
       }
 
-      // Get main cover image - updated selectors for both sites
-      const cover = cleanCoverUrl($('.product-top_cover__Pth8B, .product-cover img, .book-cover img, .product-image img').attr('src') || match.cover);
+      // Get main cover image - prefix selector with og:image / JSON-LD fallbacks
+      const cover = cleanCoverUrl(
+        $('img[class*="product-top_cover__"]').attr('src') ||
+        $('meta[property="og:image"]').attr('content') ||
+        (ld && typeof ld.image === 'string' ? ld.image : undefined) ||
+        $('.product-cover img, .book-cover img, .product-image img').attr('src') ||
+        match.cover
+      );
 
       const languages = language === 'cz' 
         ? ['czech'] 
